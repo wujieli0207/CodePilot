@@ -12,8 +12,17 @@ import type {
   OutboundMessage,
   SendResult,
 } from '../types';
+import type { FileAttachment } from '@/types';
 import { BaseChannelAdapter, registerAdapterFactory } from '../channel-adapter';
 import { callTelegramApi, escapeHtml } from './telegram-utils';
+import {
+  isImageEnabled,
+  downloadPhoto,
+  downloadDocumentImage,
+  isSupportedImageMime,
+  inferMimeType,
+} from './telegram-media';
+import type { TelegramPhotoSize, TelegramDocument } from './telegram-media';
 import { getChannelOffset, setChannelOffset, insertAuditLog } from '../../db';
 import { getSetting } from '../../db';
 
@@ -34,6 +43,10 @@ interface TelegramUpdate {
     chat: { id: number; first_name?: string; title?: string; username?: string };
     from?: { id: number; first_name: string; username?: string };
     text?: string;
+    caption?: string;
+    photo?: TelegramPhotoSize[];
+    document?: TelegramDocument;
+    media_group_id?: string;
     date: number;
   };
   callback_query?: {
@@ -52,6 +65,19 @@ interface QueueEntry {
   resolve: () => void;
 }
 
+/** Media group debounce buffer entry for album messages. */
+interface MediaGroupBufferEntry {
+  updates: TelegramUpdate[];
+  updateIds: number[];
+  timer: ReturnType<typeof setTimeout>;
+  chatId: string;
+  userId: string;
+  displayName: string;
+}
+
+/** Debounce window for media group messages (ms). */
+const MEDIA_GROUP_DEBOUNCE_MS = 500;
+
 export class TelegramAdapter extends BaseChannelAdapter {
   readonly channelType: ChannelType = 'telegram';
 
@@ -60,6 +86,7 @@ export class TelegramAdapter extends BaseChannelAdapter {
   private queue: InboundMessage[] = [];
   private waiters: Array<(msg: InboundMessage | null) => void> = [];
   private typingIntervals = new Map<string, ReturnType<typeof setInterval>>();
+  private mediaGroupBuffers = new Map<string, MediaGroupBufferEntry>();
 
   /** Committed offset — the highest update_id that has been safely enqueued or skipped. */
   private committedOffset = 0;
@@ -119,6 +146,12 @@ export class TelegramAdapter extends BaseChannelAdapter {
       clearInterval(interval);
     }
     this.typingIntervals.clear();
+
+    // Clear media group debounce timers
+    for (const [, entry] of this.mediaGroupBuffers) {
+      clearTimeout(entry.timer);
+    }
+    this.mediaGroupBuffers.clear();
 
     console.log('[telegram-adapter] Stopped');
   }
@@ -461,10 +494,11 @@ export class TelegramAdapter extends BaseChannelAdapter {
 
             // Answer callback to dismiss the loading state
             this.answerCallback(cb.id).catch(() => {});
-          } else if (update.message?.text) {
+          } else if (update.message) {
             const m = update.message;
             const chatId = String(m.chat.id);
             const userId = m.from ? String(m.from.id) : chatId;
+            const displayName = m.from?.username || m.from?.first_name || chatId;
 
             if (!this.isAuthorized(userId, chatId)) {
               console.warn('[telegram-adapter] Unauthorized message from userId:', userId, 'chatId:', chatId);
@@ -472,32 +506,51 @@ export class TelegramAdapter extends BaseChannelAdapter {
               continue;
             }
 
-            const msg: InboundMessage = {
-              messageId: String(m.message_id),
-              address: {
-                channelType: 'telegram',
-                chatId,
-                userId,
-                displayName: m.from?.username || m.from?.first_name || chatId,
-              },
-              text: m.text!,
-              timestamp: m.date * 1000,
-              raw: update,
-              updateId: update.update_id,
-            };
+            const hasPhoto = m.photo && m.photo.length > 0;
+            const hasDocImage = m.document && this.isDocumentImage(m.document);
+            const hasMedia = hasPhoto || hasDocImage;
 
-            // Audit log
-            try {
-              insertAuditLog({
-                channelType: 'telegram',
-                chatId,
-                direction: 'inbound',
+            if (hasMedia && isImageEnabled()) {
+              if (m.media_group_id) {
+                // Album message — buffer for debounce, advance fetchOffset immediately
+                this.bufferMediaGroup(m.media_group_id, update, chatId, userId, displayName);
+                // Don't markUpdateProcessed yet — offset will be committed on flush
+              } else {
+                // Single image message — process immediately
+                await this.processSingleImageMessage(update, chatId, userId, displayName);
+              }
+            } else if (m.text) {
+              // Pure text message — original logic
+              const msg: InboundMessage = {
                 messageId: String(m.message_id),
-                summary: m.text!.slice(0, 200),
-              });
-            } catch { /* best effort */ }
+                address: {
+                  channelType: 'telegram',
+                  chatId,
+                  userId,
+                  displayName,
+                },
+                text: m.text,
+                timestamp: m.date * 1000,
+                raw: update,
+                updateId: update.update_id,
+              };
 
-            this.enqueue(msg);
+              // Audit log
+              try {
+                insertAuditLog({
+                  channelType: 'telegram',
+                  chatId,
+                  direction: 'inbound',
+                  messageId: String(m.message_id),
+                  summary: m.text.slice(0, 200),
+                });
+              } catch { /* best effort */ }
+
+              this.enqueue(msg);
+            } else {
+              // Unhandled message type (sticker, voice, etc.) — skip
+              this.markUpdateProcessed(update.update_id);
+            }
           } else {
             // Unhandled update type — still safe to advance past it
             this.markUpdateProcessed(update.update_id);
@@ -516,6 +569,223 @@ export class TelegramAdapter extends BaseChannelAdapter {
         }
       }
     }
+  }
+
+  /**
+   * Check if a Telegram document is a supported image type.
+   */
+  private isDocumentImage(doc: TelegramDocument): boolean {
+    if (doc.mime_type && isSupportedImageMime(doc.mime_type)) return true;
+    if (doc.file_name) {
+      const mime = inferMimeType(doc.file_name);
+      if (mime && isSupportedImageMime(mime)) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Process a single image message (no media_group_id).
+   * Downloads the image and enqueues a message with attachments.
+   */
+  private async processSingleImageMessage(
+    update: TelegramUpdate,
+    chatId: string,
+    userId: string,
+    displayName: string,
+  ): Promise<void> {
+    const m = update.message!;
+    const token = this.botToken;
+    if (!token) {
+      this.markUpdateProcessed(update.update_id);
+      return;
+    }
+
+    const attachments: FileAttachment[] = [];
+    let rejectedReason: string | undefined;
+
+    if (m.photo && m.photo.length > 0) {
+      const att = await downloadPhoto(token, m.photo, String(m.message_id));
+      if (att) attachments.push(att);
+    } else if (m.document) {
+      const result = await downloadDocumentImage(token, m.document, String(m.message_id));
+      if (result.attachment) {
+        attachments.push(result.attachment);
+      } else if (result.rejected) {
+        rejectedReason = result.rejected;
+      }
+    }
+
+    const text = m.caption || m.text || '';
+    const hasContent = attachments.length > 0 || text.trim();
+
+    if (!hasContent) {
+      // Nothing usable — if rejected, we'll still mark processed
+      if (rejectedReason && rejectedReason !== 'unsupported_type') {
+        // Enqueue a rejection notification as text
+        const msg: InboundMessage = {
+          messageId: String(m.message_id),
+          address: { channelType: 'telegram', chatId, userId, displayName },
+          text: `[Image rejected] ${rejectedReason}`,
+          timestamp: m.date * 1000,
+          raw: update,
+          updateId: update.update_id,
+        };
+        this.enqueue(msg);
+      } else {
+        this.markUpdateProcessed(update.update_id);
+      }
+      return;
+    }
+
+    const summary = attachments.length > 0
+      ? `[${attachments.length} image(s)] ${text.slice(0, 150)}`
+      : text.slice(0, 200);
+
+    // Audit log
+    try {
+      insertAuditLog({
+        channelType: 'telegram',
+        chatId,
+        direction: 'inbound',
+        messageId: String(m.message_id),
+        summary,
+      });
+    } catch { /* best effort */ }
+
+    const msg: InboundMessage = {
+      messageId: String(m.message_id),
+      address: { channelType: 'telegram', chatId, userId, displayName },
+      text: text,
+      timestamp: m.date * 1000,
+      raw: update,
+      updateId: update.update_id,
+      attachments: attachments.length > 0 ? attachments : undefined,
+    };
+
+    this.enqueue(msg);
+  }
+
+  /**
+   * Buffer a media group update for debounced processing.
+   * Resets the 500ms timer on each new update in the same group.
+   */
+  private bufferMediaGroup(
+    mediaGroupId: string,
+    update: TelegramUpdate,
+    chatId: string,
+    userId: string,
+    displayName: string,
+  ): void {
+    const existing = this.mediaGroupBuffers.get(mediaGroupId);
+
+    if (existing) {
+      // Add to existing buffer, reset timer
+      clearTimeout(existing.timer);
+      existing.updates.push(update);
+      existing.updateIds.push(update.update_id);
+      existing.timer = setTimeout(() => this.flushMediaGroup(mediaGroupId), MEDIA_GROUP_DEBOUNCE_MS);
+    } else {
+      // New buffer
+      const timer = setTimeout(() => this.flushMediaGroup(mediaGroupId), MEDIA_GROUP_DEBOUNCE_MS);
+      this.mediaGroupBuffers.set(mediaGroupId, {
+        updates: [update],
+        updateIds: [update.update_id],
+        timer,
+        chatId,
+        userId,
+        displayName,
+      });
+    }
+  }
+
+  /**
+   * Flush a media group buffer — download all images and enqueue a single message.
+   */
+  private async flushMediaGroup(mediaGroupId: string): Promise<void> {
+    const entry = this.mediaGroupBuffers.get(mediaGroupId);
+    if (!entry) return;
+    this.mediaGroupBuffers.delete(mediaGroupId);
+
+    const token = this.botToken;
+    if (!token) {
+      // Can't download — mark all as processed
+      for (const uid of entry.updateIds) {
+        this.markUpdateProcessed(uid);
+      }
+      this.persistCommittedOffset();
+      return;
+    }
+
+    const attachments: FileAttachment[] = [];
+    let caption = '';
+    let firstMessageId = '';
+    let firstDate = 0;
+
+    // Download all images in the group
+    for (const update of entry.updates) {
+      const m = update.message!;
+      if (!firstMessageId) {
+        firstMessageId = String(m.message_id);
+        firstDate = m.date;
+      }
+      // Use caption from whichever update has it (Telegram only sends caption on one)
+      if (m.caption && !caption) {
+        caption = m.caption;
+      }
+
+      if (m.photo && m.photo.length > 0) {
+        const att = await downloadPhoto(token, m.photo, String(m.message_id));
+        if (att) attachments.push(att);
+      } else if (m.document && this.isDocumentImage(m.document)) {
+        const result = await downloadDocumentImage(token, m.document, String(m.message_id));
+        if (result.attachment) attachments.push(result.attachment);
+      }
+    }
+
+    const text = caption;
+    const hasContent = attachments.length > 0 || text.trim();
+
+    if (!hasContent) {
+      // All downloads failed and no caption — mark all processed
+      for (const uid of entry.updateIds) {
+        this.markUpdateProcessed(uid);
+      }
+      this.persistCommittedOffset();
+      return;
+    }
+
+    const summary = attachments.length > 0
+      ? `[Album: ${attachments.length} image(s)] ${text.slice(0, 150)}`
+      : text.slice(0, 200);
+
+    try {
+      insertAuditLog({
+        channelType: 'telegram',
+        chatId: entry.chatId,
+        direction: 'inbound',
+        messageId: firstMessageId,
+        summary,
+      });
+    } catch { /* best effort */ }
+
+    // Use the max updateId so acknowledgeUpdate advances offset past all buffered updates
+    const maxUpdateId = Math.max(...entry.updateIds);
+
+    const msg: InboundMessage = {
+      messageId: firstMessageId,
+      address: {
+        channelType: 'telegram',
+        chatId: entry.chatId,
+        userId: entry.userId,
+        displayName: entry.displayName,
+      },
+      text,
+      timestamp: firstDate * 1000,
+      updateId: maxUpdateId,
+      attachments: attachments.length > 0 ? attachments : undefined,
+    };
+
+    this.enqueue(msg);
   }
 }
 

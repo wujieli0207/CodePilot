@@ -7,7 +7,7 @@
  */
 
 import type { ChannelBinding } from './types';
-import type { SSEEvent, TokenUsage, MessageContentBlock } from '@/types';
+import type { SSEEvent, TokenUsage, MessageContentBlock, FileAttachment } from '@/types';
 import { streamClaude } from '../claude-client';
 import {
   addMessage,
@@ -61,6 +61,7 @@ export async function processMessage(
   text: string,
   onPermissionRequest?: OnPermissionRequest,
   abortSignal?: AbortSignal,
+  files?: FileAttachment[],
 ): Promise<ConversationResult> {
   const sessionId = binding.codepilotSessionId;
 
@@ -86,8 +87,11 @@ export async function processMessage(
   }, 60_000);
 
   try {
-    // Save user message
-    addMessage(sessionId, 'user', text);
+    // Save user message (with image indicator if attachments present)
+    const userMsgText = files && files.length > 0
+      ? `[${files.length} image(s) attached] ${text}`
+      : text;
+    addMessage(sessionId, 'user', userMsgText);
 
     // Resolve provider
     const session = getSession(sessionId);
@@ -139,6 +143,7 @@ export async function processMessage(
       permissionMode,
       provider: resolvedProvider,
       conversationHistory: historyMsgs,
+      files,
       onRuntimeStatusChange: (status: string) => {
         try { setSessionRuntimeStatus(sessionId, status); } catch { /* best effort */ }
       },

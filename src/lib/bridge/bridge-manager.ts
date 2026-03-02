@@ -328,7 +328,8 @@ async function handleMessage(
   }
 
   const rawText = msg.text.trim();
-  if (!rawText) { ack(); return; }
+  const hasAttachments = msg.attachments && msg.attachments.length > 0;
+  if (!rawText && !hasAttachments) { ack(); return; }
 
   // Check for IM commands (before sanitization — commands are validated individually)
   if (rawText.startsWith('/')) {
@@ -350,7 +351,7 @@ async function handleMessage(
     });
   }
 
-  if (!text) { ack(); return; }
+  if (!text && !hasAttachments) { ack(); return; }
 
   // Regular message — route to conversation engine
   const binding = router.resolve(msg.address);
@@ -366,7 +367,10 @@ async function handleMessage(
   try {
     // Pass permission callback so requests are forwarded to IM immediately
     // during streaming (the stream blocks until permission is resolved).
-    const result = await engine.processMessage(binding, text, async (perm) => {
+    // Use text or empty string for image-only messages (prompt is still required by streamClaude)
+    const promptText = text || (hasAttachments ? 'Describe this image.' : '');
+
+    const result = await engine.processMessage(binding, promptText, async (perm) => {
       await broker.forwardPermissionRequest(
         adapter,
         msg.address,
@@ -376,7 +380,7 @@ async function handleMessage(
         binding.codepilotSessionId,
         perm.suggestions,
       );
-    }, taskAbort.signal);
+    }, taskAbort.signal, hasAttachments ? msg.attachments : undefined);
 
     // Send response text
     if (result.responseText) {

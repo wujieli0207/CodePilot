@@ -49,6 +49,8 @@ export interface InboundMessage {
   raw?: unknown;
   /** Adapter-specific update ID for deferred offset acknowledgement */
   updateId?: number;
+  /** File attachments (images, documents) from the IM channel */
+  attachments?: import('@/types').FileAttachment[];
 }
 
 /** Outbound message to send to an IM channel */
