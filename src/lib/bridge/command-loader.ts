@@ -7,6 +7,8 @@
  *
  * These are the same directories that Claude Code CLI uses for custom slash commands.
  * Commands are loaded as prompt templates that get forwarded to the conversation engine.
+ *
+ * Results are cached in memory with a TTL to avoid repeated filesystem scans.
  */
 
 import fs from 'fs';
@@ -17,6 +19,8 @@ import os from 'os';
 export interface CustomCommand {
   /** Command name without leading slash (e.g. "commit", "review:pr") */
   readonly name: string;
+  /** Telegram-safe command name (colons → underscores, lowercase, alphanumeric only) */
+  readonly telegramName: string;
   /** Short description extracted from the first line of the .md file */
   readonly description: string;
   /** Full prompt template content */
@@ -35,6 +39,18 @@ const RESERVED_COMMANDS = new Set([
   'status', 'sessions', 'stop', 'help',
 ]);
 
+/** Cache entry with TTL tracking. */
+interface CacheEntry {
+  readonly commands: readonly CustomCommand[];
+  readonly expiresAt: number;
+}
+
+/** In-memory cache keyed by working directory (or '__global__' for no-project calls). */
+const cache = new Map<string, CacheEntry>();
+
+/** Cache TTL in milliseconds (30 seconds). */
+const CACHE_TTL_MS = 30_000;
+
 /**
  * Get the global commands directory path.
  */
@@ -47,6 +63,14 @@ function getGlobalCommandsDir(): string {
  */
 function getProjectCommandsDir(workingDirectory?: string): string {
   return path.join(workingDirectory || process.cwd(), '.claude', 'commands');
+}
+
+/**
+ * Convert a command name to a Telegram-compatible command name.
+ * Colons → underscores, lowercase, strip non-alphanumeric/underscore chars.
+ */
+function toTelegramName(name: string): string {
+  return name.replace(/:/g, '_').toLowerCase().replace(/[^a-z0-9_]/g, '');
 }
 
 /**
@@ -92,14 +116,22 @@ function scanDirectory(
 
       commands.push({
         name,
+        telegramName: toTelegramName(name),
         description: description.slice(0, 256),
         content,
         source,
         filePath: fullPath,
       });
     }
-  } catch {
-    // Silently ignore read errors (directory might not exist or be inaccessible)
+  } catch (err: unknown) {
+    // Log permission errors specifically to aid troubleshooting
+    if (err instanceof Error && 'code' in err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'EACCES' || code === 'EPERM') {
+        console.warn(`[command-loader] Permission denied reading ${dir}: ${err.message}`);
+      }
+    }
+    // Other errors (e.g. directory vanished between exists check and read) are silently ignored
   }
 
   return commands;
@@ -109,9 +141,17 @@ function scanDirectory(
  * Load all custom commands from global and project directories.
  *
  * Project commands take priority over global commands with the same name.
- * Returns an immutable array of commands.
+ * Results are cached in memory with a 30-second TTL to avoid repeated I/O.
  */
 export function loadCustomCommands(workingDirectory?: string): readonly CustomCommand[] {
+  const cacheKey = workingDirectory || '__global__';
+  const now = Date.now();
+
+  const cached = cache.get(cacheKey);
+  if (cached && cached.expiresAt > now) {
+    return cached.commands;
+  }
+
   const globalDir = getGlobalCommandsDir();
   const projectDir = getProjectCommandsDir(workingDirectory);
 
@@ -122,11 +162,14 @@ export function loadCustomCommands(workingDirectory?: string): readonly CustomCo
   const projectNames = new Set(projectCommands.map(c => c.name));
   const dedupedGlobal = globalCommands.filter(c => !projectNames.has(c.name));
 
-  return [...projectCommands, ...dedupedGlobal];
+  const result = [...projectCommands, ...dedupedGlobal];
+  cache.set(cacheKey, { commands: result, expiresAt: now + CACHE_TTL_MS });
+
+  return result;
 }
 
 /**
- * Find a specific custom command by name.
+ * Find a custom command by its original name or Telegram-safe name.
  * Searches project commands first, then global commands.
  */
 export function findCustomCommand(
@@ -134,7 +177,16 @@ export function findCustomCommand(
   workingDirectory?: string,
 ): CustomCommand | null {
   const commands = loadCustomCommands(workingDirectory);
-  return commands.find(c => c.name === name) ?? null;
+
+  // Exact match on original name
+  const exact = commands.find(c => c.name === name);
+  if (exact) return exact;
+
+  // Match on Telegram-safe name (handles underscore↔colon mapping)
+  const byTelegram = commands.find(c => c.telegramName === name);
+  if (byTelegram) return byTelegram;
+
+  return null;
 }
 
 /**
@@ -142,4 +194,11 @@ export function findCustomCommand(
  */
 export function isReservedCommand(name: string): boolean {
   return RESERVED_COMMANDS.has(name);
+}
+
+/**
+ * Clear the command cache. Useful for testing or when commands have changed.
+ */
+export function clearCommandCache(): void {
+  cache.clear();
 }

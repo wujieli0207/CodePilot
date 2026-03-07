@@ -319,14 +319,22 @@ export class TelegramAdapter extends BaseChannelAdapter {
     const customCommands = loadCustomCommands();
     const customTelegramCommands = customCommands
       .map(cmd => ({
-        // Telegram command names: lowercase, no special chars except underscores
-        // Colon-separated names (e.g. "review:pr") become "review_pr"
-        command: cmd.name.replace(/:/g, '_').toLowerCase().replace(/[^a-z0-9_]/g, ''),
+        // Use pre-computed telegramName from command-loader (explicit mapping)
+        command: cmd.telegramName,
         description: cmd.description.slice(0, 256),
       }))
       .filter(cmd => cmd.command.length > 0 && cmd.command.length <= 32);
 
+    const totalCommands = builtinCommands.length + customTelegramCommands.length;
+
     // Telegram API limits: max 100 commands
+    if (totalCommands > 100) {
+      console.warn(
+        `[telegram-adapter] ${totalCommands} commands exceed Telegram's 100-command limit. ` +
+        `${totalCommands - 100} custom command(s) will be silently truncated.`
+      );
+    }
+
     const allCommands = [...builtinCommands, ...customTelegramCommands].slice(0, 100);
 
     await callTelegramApi(token, 'setMyCommands', { commands: allCommands });

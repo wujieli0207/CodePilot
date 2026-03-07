@@ -358,67 +358,14 @@ async function handleMessage(
 
   // Regular message — route to conversation engine
   const binding = router.resolve(msg.address);
-
-  // Notify adapter that message processing is starting (e.g., typing indicator)
-  adapter.onMessageStart?.(msg.address.chatId);
-
-  // Create an AbortController so /stop can cancel this task externally
-  const taskAbort = new AbortController();
-  const state = getState();
-  state.activeTasks.set(binding.codepilotSessionId, taskAbort);
+  const promptText = text || (hasAttachments ? 'Describe this image.' : '');
 
   try {
-    // Pass permission callback so requests are forwarded to IM immediately
-    // during streaming (the stream blocks until permission is resolved).
-    // Use text or empty string for image-only messages (prompt is still required by streamClaude)
-    const promptText = text || (hasAttachments ? 'Describe this image.' : '');
-
-    const result = await engine.processMessage(binding, promptText, async (perm) => {
-      await broker.forwardPermissionRequest(
-        adapter,
-        msg.address,
-        perm.permissionRequestId,
-        perm.toolName,
-        perm.toolInput,
-        binding.codepilotSessionId,
-        perm.suggestions,
-      );
-    }, taskAbort.signal, hasAttachments ? msg.attachments : undefined);
-
-    // Send response text — render Markdown to Telegram HTML
-    if (result.responseText) {
-      const chunks = markdownToTelegramChunks(result.responseText, 4096);
-      if (chunks.length > 0) {
-        await deliverRendered(adapter, msg.address, chunks, {
-          sessionId: binding.codepilotSessionId,
-        });
-      }
-    } else if (result.hasError) {
-      const errorResponse: OutboundMessage = {
-        address: msg.address,
-        text: `<b>Error:</b> ${escapeHtml(result.errorMessage)}`,
-        parseMode: 'HTML',
-      };
-      await deliver(adapter, errorResponse);
-    }
-
-    // Persist the actual SDK session ID for future resume.
-    // If the result has an error and no session ID was captured, clear the
-    // stale ID so the next message starts fresh instead of retrying a broken resume.
-    if (binding.id) {
-      try {
-        if (result.sdkSessionId) {
-          updateChannelBinding(binding.id, { sdkSessionId: result.sdkSessionId });
-        } else if (result.hasError && binding.sdkSessionId) {
-          updateChannelBinding(binding.id, { sdkSessionId: '' });
-        }
-      } catch { /* best effort */ }
-    }
+    await processConversation(
+      adapter, msg, binding, promptText,
+      hasAttachments ? msg.attachments : undefined,
+    );
   } finally {
-    state.activeTasks.delete(binding.codepilotSessionId);
-    // Notify adapter that message processing ended
-    adapter.onMessageEnd?.(msg.address.chatId);
-    // Commit the offset only after full processing (success or failure)
     ack();
   }
 }
@@ -610,10 +557,9 @@ async function handleCommand(
       const commandName = command.slice(1); // Remove leading '/'
       const binding = router.resolve(msg.address);
 
-      // Try exact name first, then underscore→colon fallback
-      // (Telegram converts "review:pr" to "review_pr" in command names)
-      const customCmd = findCustomCommand(commandName, binding.workingDirectory)
-        ?? findCustomCommand(commandName.replace(/_/g, ':'), binding.workingDirectory);
+      // findCustomCommand handles both original names and Telegram-safe names
+      // (e.g. "review:pr" and "review_pr" both resolve correctly)
+      const customCmd = findCustomCommand(commandName, binding.workingDirectory);
 
       if (customCmd) {
         // Custom command found — expand the .md content as prompt,
@@ -642,16 +588,16 @@ async function handleCommand(
 }
 
 /**
- * Forward a prompt to the conversation engine and deliver the response.
- * Used for custom commands and unrecognized slash commands.
+ * Core conversation processing: send prompt to engine, deliver response, persist session.
+ * Shared by both regular message handling and slash command forwarding.
  */
-async function forwardToConversation(
+async function processConversation(
   adapter: BaseChannelAdapter,
   msg: InboundMessage,
-  binding: import('./types').ChannelBinding,
+  binding: ReturnType<typeof router.resolve>,
   prompt: string,
+  attachments?: InboundMessage['attachments'],
 ): Promise<void> {
-  // Notify adapter that message processing is starting
   adapter.onMessageStart?.(msg.address.chatId);
 
   const taskAbort = new AbortController();
@@ -669,7 +615,7 @@ async function forwardToConversation(
         binding.codepilotSessionId,
         perm.suggestions,
       );
-    }, taskAbort.signal);
+    }, taskAbort.signal, attachments);
 
     if (result.responseText) {
       const chunks = markdownToTelegramChunks(result.responseText, 4096);
@@ -686,7 +632,6 @@ async function forwardToConversation(
       });
     }
 
-    // Persist SDK session ID for future resume
     if (binding.id) {
       try {
         if (result.sdkSessionId) {
@@ -700,4 +645,17 @@ async function forwardToConversation(
     state.activeTasks.delete(binding.codepilotSessionId);
     adapter.onMessageEnd?.(msg.address.chatId);
   }
+}
+
+/**
+ * Forward a prompt to the conversation engine and deliver the response.
+ * Used for custom commands and unrecognized slash commands.
+ */
+async function forwardToConversation(
+  adapter: BaseChannelAdapter,
+  msg: InboundMessage,
+  binding: ReturnType<typeof router.resolve>,
+  prompt: string,
+): Promise<void> {
+  await processConversation(adapter, msg, binding, prompt);
 }
