@@ -78,6 +78,9 @@ interface MediaGroupBufferEntry {
 /** Debounce window for media group messages (ms). */
 const MEDIA_GROUP_DEBOUNCE_MS = 500;
 
+/** Max characters to keep from a quoted/replied-to message to avoid bloating the prompt. */
+const REPLY_TEXT_MAX_LENGTH = 1000;
+
 export class TelegramAdapter extends BaseChannelAdapter {
   readonly channelType: ChannelType = 'telegram';
 
@@ -614,7 +617,7 @@ export class TelegramAdapter extends BaseChannelAdapter {
 
     return {
       messageId: String(replyTo.message_id),
-      text: text.slice(0, 1000), // Truncate to avoid bloating the prompt
+      text: text.slice(0, REPLY_TEXT_MAX_LENGTH),
       senderName,
       isBot: replyTo.from?.is_bot ?? false,
     };

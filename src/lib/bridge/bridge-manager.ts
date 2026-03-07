@@ -303,7 +303,9 @@ function prependReplyContext(prompt: string, replyContext?: ReplyContext): strin
       ? `@${replyContext.senderName}`
       : 'Someone';
 
-  return `[Replying to ${sender}]: "${replyContext.text}"\n\n${prompt}`;
+  // Use markdown block-quote to avoid format breakage when quoted text contains double quotes
+  const quotedLines = replyContext.text.split('\n').map(line => `> ${line}`).join('\n');
+  return `[Replying to ${sender}]:\n${quotedLines}\n\n${prompt}`;
 }
 
 /**
